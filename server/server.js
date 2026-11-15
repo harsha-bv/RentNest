@@ -12,9 +12,10 @@ import jwt from "jsonwebtoken";
 import mongoose from "mongoose";
 import dns from "node:dns";
 import multer from "multer";
-import nodemailer from "nodemailer";
+import { sendVerificationEmail } from "./utils/sendEmail.js";
+import { isAllowedEmailAddress } from "./utils/emailAddress.js";
+import { validateEmailDeliverability } from "./utils/validateEmailDeliverability.js";
 import { Server as SocketServer } from "socket.io";
-import twilio from "twilio";
 
 dotenv.config();
 
@@ -56,8 +57,7 @@ const userSchema = new mongoose.Schema({
     index: { unique: true, partialFilterExpression: { phone: { $type: "string" } } },
   },
   emailVerified: { type: Boolean, default: false },
-  phoneVerified: { type: Boolean, default: false },
-  phoneVerificationSentAt: { type: Date },
+  tokenVersion: { type: Number, default: 0 },
   passwordHash: { type: String, required: true, select: false },
   role: { type: String, enum: ["renter", "owner"], default: "renter" },
 }, { timestamps: true });
@@ -118,19 +118,30 @@ const EmailCode = mongoose.models.EmailCode || mongoose.model("EmailCode", email
 
 io.use((socket, next) => {
   const token = socket.handshake.auth?.token;
+
   if (!token) return next();
+
   let claims;
+
   try {
     claims = jwt.verify(token, JWT_SECRET, { issuer: "rentnest" });
   } catch {
     return next();
   }
-  return User.findById(claims.sub).select("emailVerified phoneVerified").lean()
+
+  return User.findById(claims.sub)
+    .select("email emailVerified tokenVersion")
+    .lean()
     .then((account) => {
-      if (account?.emailVerified && account.phoneVerified) {
+      if (
+        account?.emailVerified &&
+        isAllowedEmailAddress(account.email) &&
+        (claims.ver ?? 0) === (account.tokenVersion ?? 0)
+      ) {
         socket.data.userId = account._id.toString();
         socket.data.expiresAt = claims.exp;
       }
+
       return next();
     })
     .catch(next);
@@ -177,12 +188,14 @@ function publicUser(user) {
     phone: user.phone,
     role: user.role,
     emailVerified: Boolean(user.emailVerified),
-    phoneVerified: Boolean(user.phoneVerified),
   };
 }
-
 function signToken(user) {
-  return jwt.sign({ sub: user._id.toString(), role: user.role }, JWT_SECRET, { expiresIn: "7d", issuer: "rentnest" });
+  return jwt.sign({
+    sub: user._id.toString(),
+    role: user.role,
+    ver: user.tokenVersion ?? 0,
+  }, JWT_SECRET, { expiresIn: "7d", issuer: "rentnest" });
 }
 
 function verificationError(message, status = 503) {
@@ -191,84 +204,50 @@ function verificationError(message, status = 503) {
   return error;
 }
 
-function normalizeIndianPhone(value) {
-  if (typeof value !== "string") return null;
-  const compact = value.replace(/[\s()-]/g, "");
-  const phone = /^\d{10}$/.test(compact) ? `+91${compact}` : compact;
-  return /^\+91[6-9]\d{9}$/.test(phone) ? phone : null;
-}
-
 function verificationHash(userId, code) {
   return crypto.createHmac("sha256", JWT_SECRET).update(`${userId}:${code}`).digest("hex");
 }
 
-function createEmailTransport() {
-  const { SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS } = process.env;
-  if (!SMTP_HOST || !SMTP_PORT || !SMTP_USER || !SMTP_PASS || !process.env.EMAIL_FROM) {
-    throw verificationError("Email verification is not configured. Set SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS, and EMAIL_FROM.");
-  }
-  const port = Number(SMTP_PORT);
-  if (!Number.isInteger(port) || port < 1 || port > 65535) {
-    throw verificationError("SMTP_PORT must be a valid port number.");
-  }
-  return nodemailer.createTransport({
-    host: SMTP_HOST,
-    port,
-    secure: port === 465,
-    auth: { user: SMTP_USER, pass: SMTP_PASS },
-  });
-}
 
 async function sendEmailCode(user) {
-  if (user.emailVerified) throw verificationError("This email address is already verified.", 400);
+  if (user.emailVerified) {
+    throw verificationError("This email address is already verified.", 400);
+  }
+
   const now = new Date();
+
   const currentCode = await EmailCode.findOne({ user: user._id });
-  if (currentCode && now.getTime() - currentCode.lastSentAt.getTime() < 60_000) {
-    throw verificationError("Wait a minute before requesting another email code.", 429);
+
+  if (
+    currentCode &&
+    now.getTime() - currentCode.lastSentAt.getTime() < 60_000
+  ) {
+    throw verificationError(
+      "Wait a minute before requesting another email code.",
+      429
+    );
   }
 
   const code = crypto.randomInt(100000, 1000000).toString();
+
   await EmailCode.findOneAndUpdate(
     { user: user._id },
     {
       codeHash: verificationHash(user._id, code),
       attempts: 0,
       lastSentAt: now,
-      expiresAt: new Date(now.getTime() + 10 * 60_000),
+      expiresAt: new Date(now.getTime() + 5 * 60_000),
     },
-    { upsert: true, new: true, setDefaultsOnInsert: true },
+    { upsert: true, new: true, setDefaultsOnInsert: true }
   );
-  await createEmailTransport().sendMail({
-    from: process.env.EMAIL_FROM,
-    to: user.email,
-    subject: "Your RentNest verification code",
-    text: `Hi ${user.name},\n\nYour RentNest verification code is ${code}. It expires in 10 minutes.\n\nIf you did not create this account, you can ignore this email.`,
-  });
+
+  await sendVerificationEmail(user.email, code);
 }
 
-function createTwilioClient() {
-  const { TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN } = process.env;
-  if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN || !process.env.TWILIO_VERIFY_SERVICE_SID) {
-    throw verificationError("Phone verification is not configured. Set the Twilio account and Verify service credentials.");
-  }
-  return twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN);
-}
-
-async function sendPhoneCode(user) {
-  if (!user.phone) throw verificationError("Add a valid Indian mobile number before requesting a phone code.", 400);
-  if (user.phoneVerified) throw verificationError("This phone number is already verified.", 400);
-  const now = new Date();
-  if (user.phoneVerificationSentAt && now.getTime() - user.phoneVerificationSentAt.getTime() < 60_000) {
-    throw verificationError("Wait a minute before requesting another SMS code.", 429);
-  }
-  user.phoneVerificationSentAt = now;
-  await user.save();
-  await createTwilioClient().verify.v2.services(process.env.TWILIO_VERIFY_SERVICE_SID)
-    .verifications.create({ to: user.phone, channel: "sms" });
-}
 
 function authPayload(user) {
-  const verified = user.emailVerified && user.phoneVerified;
+  const verified = Boolean(user.emailVerified && isAllowedEmailAddress(user.email));
+
   return {
     ...(verified ? { token: signToken(user) } : {}),
     user: publicUser(user),
@@ -304,11 +283,18 @@ async function requireAuth(req, res, next) {
   } catch {
     return res.status(401).json({ message: "Your session has expired. Please sign in again." });
   }
-  const account = await User.findById(claims.sub).select("role emailVerified phoneVerified").lean();
+  const account = await User.findById(claims.sub)
+  .select("email role emailVerified tokenVersion")
+  .lean();
   if (!account) return res.status(401).json({ message: "This account is no longer available." });
-  if (!account.emailVerified || !account.phoneVerified) {
-    return res.status(403).json({ message: "Verify your email and phone to continue." });
+  if ((claims.ver ?? 0) !== (account.tokenVersion ?? 0)) {
+    return res.status(401).json({ message: "This session has been revoked. Please sign in again." });
   }
+  if (!account.emailVerified || !isAllowedEmailAddress(account.email)) {
+  return res.status(403).json({
+    message: "Verify your email to continue.",
+  });
+}
   req.auth = { id: account._id.toString(), role: account.role };
   return next();
 }
@@ -382,77 +368,133 @@ app.get("/api/health", (_req, res) => {
 });
 
 app.post("/api/auth/register", authLimiter, async (req, res) => {
-  const { name, email, phone, password, role } = req.body;
-  if (typeof name !== "string" || name.trim().length < 2 || name.trim().length > 80) {
-    return res.status(400).json({ message: "Enter a name between 2 and 80 characters." });
+  const { name, email, password, role } = req.body;
+
+  if (
+    typeof name !== "string" ||
+    name.trim().length < 2 ||
+    name.trim().length > 80
+  ) {
+    return res.status(400).json({
+      message: "Enter a name between 2 and 80 characters.",
+    });
   }
-  if (typeof email !== "string" || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || email.length > 254) {
-    return res.status(400).json({ message: "Enter a valid email address." });
+
+  if (!isAllowedEmailAddress(email)) {
+    return res.status(400).json({
+      message: "Enter a real email address you can access.",
+    });
   }
-  const normalizedPhone = normalizeIndianPhone(phone);
-  if (!normalizedPhone) return res.status(400).json({ message: "Enter a valid 10-digit Indian mobile number with +91." });
-  if (typeof password !== "string" || password.length < 8 || password.length > 72) {
-    return res.status(400).json({ message: "Password must be between 8 and 72 characters." });
+
+  if (
+    typeof password !== "string" ||
+    password.length < 8 ||
+    password.length > 72
+  ) {
+    return res.status(400).json({
+      message: "Password must be between 8 and 72 characters.",
+    });
   }
+
   if (role !== undefined && !["renter", "owner"].includes(role)) {
-    return res.status(400).json({ message: "Choose renter or owner account type." });
+    return res.status(400).json({
+      message: "Choose renter or owner account type.",
+    });
   }
+
   const normalizedEmail = email.trim().toLowerCase();
-  const existingUser = await User.findOne({ $or: [{ email: normalizedEmail }, { phone: normalizedPhone }] }).lean();
+
+  const existingUser = await User.findOne({
+    email: normalizedEmail,
+  }).lean();
+
   if (existingUser) {
-    const message = existingUser.email === normalizedEmail
-      ? "An account with that email already exists."
-      : "An account with that phone number already exists.";
-    return res.status(409).json({ message });
+    return res.status(409).json({
+      message: "An account with that email already exists.",
+    });
+  }
+
+  if (!(await validateEmailDeliverability(normalizedEmail))) {
+    return res.status(400).json({
+      message: "That email does not appear to be an existing, deliverable inbox. Use an email address you can access.",
+    });
   }
 
   const user = await User.create({
     name: name.trim(),
     email: normalizedEmail,
-    phone: normalizedPhone,
     passwordHash: await bcrypt.hash(password, 12),
     role: role || "renter",
   });
-  const deliveryResults = await Promise.allSettled([sendEmailCode(user), sendPhoneCode(user)]);
-  const emailSent = deliveryResults[0].status === "fulfilled";
-  const phoneSent = deliveryResults[1].status === "fulfilled";
-  const deliveryFailure = !emailSent && !phoneSent
-    ? "Email and SMS verification could not be sent. Check the email and Twilio settings, then request the codes again."
-    : !emailSent
-      ? "Your account was created, but the email code could not be sent. Check SMTP settings or request another email code."
-      : !phoneSent
-        ? "Your account was created and the email code was sent, but SMS failed. Check Twilio settings or request another SMS code."
-        : "";
-  return res.status(deliveryFailure ? 503 : 201).json({
-    message: deliveryFailure || "Verification codes sent. Verify your email and phone to activate your account.",
-    user: publicUser(user),
-    verificationRequired: true,
-    delivery: { email: emailSent, phone: phoneSent },
-  });
+
+  try {
+    await sendEmailCode(user);
+
+    return res.status(201).json({
+      message: "A verification code has been sent to your email.",
+      user: publicUser(user),
+      verificationRequired: true,
+      delivery: { email: true },
+    });
+  } catch (error) {
+    console.error("Registration email delivery failed:", error.message);
+
+    return res.status(503).json({
+      message:
+        "Your account was created, but the email verification code could not be sent. Please request a new code.",
+      user: publicUser(user),
+      verificationRequired: true,
+      delivery: { email: false },
+    });
+  }
 });
 
 app.post("/api/auth/login", authLimiter, async (req, res) => {
   const { email, password } = req.body;
-  if (typeof email !== "string" || typeof password !== "string" || password.length > 72) {
-    return res.status(400).json({ message: "Enter your email and password." });
+
+  if (
+    !isAllowedEmailAddress(email) ||
+    typeof password !== "string" ||
+    password.length > 72
+  ) {
+    return res.status(400).json({
+      message: "Enter your email and password.",
+    });
   }
-  const user = await User.findOne({ email: email.trim().toLowerCase() }).select("+passwordHash");
+
+  const user = await User.findOne({
+    email: email.trim().toLowerCase(),
+  }).select("+passwordHash");
+
   if (!user || !(await bcrypt.compare(password, user.passwordHash))) {
-    return res.status(401).json({ message: "Email or password is incorrect." });
+    return res.status(401).json({
+      message: "Email or password is incorrect.",
+    });
   }
-  if (!user.emailVerified || !user.phoneVerified) {
+
+  if (!user.emailVerified) {
     return res.status(403).json({
-      message: "Verify your email and phone before signing in. You can resend either code.",
+      message: "Verify your email before signing in.",
       ...authPayload(user),
     });
   }
+
   return res.json(authPayload(user));
+});
+
+app.post("/api/auth/logout", requireAuth, async (req, res) => {
+  const result = await User.updateOne({ _id: req.auth.id }, { $inc: { tokenVersion: 1 } });
+  if (!result.matchedCount) return res.status(401).json({ message: "This account is no longer available." });
+  io.in(`user:${req.auth.id}`).disconnectSockets(true);
+  return res.json({ message: "Signed out. Your active sessions have been revoked." });
 });
 
 app.post("/api/auth/verify-email", authLimiter, async (req, res) => {
   const email = typeof req.body.email === "string" ? req.body.email.trim().toLowerCase() : "";
   const code = typeof req.body.code === "string" ? req.body.code.trim() : "";
-  if (!email || !/^\d{6}$/.test(code)) return res.status(400).json({ message: "Enter your email and the 6-digit code." });
+  if (!isAllowedEmailAddress(email) || !/^\d{6}$/.test(code)) {
+    return res.status(400).json({ message: "Enter a real email address and the 6-digit code." });
+  }
   const user = await User.findOne({ email });
   if (!user) return res.status(400).json({ message: "The email or verification code is incorrect." });
   if (user.emailVerified) return res.json(authPayload(user));
@@ -473,69 +515,105 @@ app.post("/api/auth/verify-email", authLimiter, async (req, res) => {
   return res.json({ message: "Email verified.", ...authPayload(user) });
 });
 
-app.post("/api/auth/verify-phone", authLimiter, async (req, res) => {
-  const email = typeof req.body.email === "string" ? req.body.email.trim().toLowerCase() : "";
-  const phone = normalizeIndianPhone(req.body.phone);
-  const code = typeof req.body.code === "string" ? req.body.code.trim() : "";
-  if (!email || !phone || !/^\d{6}$/.test(code)) {
-    return res.status(400).json({ message: "Enter your account email, Indian phone number, and 6-digit SMS code." });
-  }
-  const user = await User.findOne({ email, phone });
-  if (!user) return res.status(400).json({ message: "The phone number or verification code is incorrect." });
-  if (user.phoneVerified) return res.json(authPayload(user));
 
-  const verification = await createTwilioClient().verify.v2.services(process.env.TWILIO_VERIFY_SERVICE_SID)
-    .verificationChecks.create({ to: phone, code });
-  if (verification.status !== "approved") return res.status(400).json({ message: "That SMS code is incorrect or expired." });
-  user.phoneVerified = true;
-  await user.save();
-  return res.json({ message: "Phone verified.", ...authPayload(user) });
-});
 
 app.post("/api/auth/resend-verification", resendLimiter, async (req, res) => {
-  const email = typeof req.body.email === "string" ? req.body.email.trim().toLowerCase() : "";
-  const channel = req.body.channel;
-  if (!email || !["email", "phone"].includes(channel)) {
-    return res.status(400).json({ message: "Choose email or phone verification." });
+  const email =
+    typeof req.body.email === "string"
+      ? req.body.email.trim().toLowerCase()
+      : "";
+
+  if (!isAllowedEmailAddress(email)) {
+    return res.status(400).json({
+      message: "Enter a real email address you can access.",
+    });
   }
+
   const user = await User.findOne({ email });
-  if (!user) return res.json({ message: "If the account exists, a new verification code will be sent." });
-  if (channel === "email") await sendEmailCode(user);
-  else await sendPhoneCode(user);
-  return res.json({ message: `A new ${channel === "email" ? "email" : "SMS"} code was sent.` });
+
+  if (!user) {
+    return res.json({
+      message: "If the account exists, a new verification code will be sent.",
+    });
+  }
+
+  if (user.emailVerified) {
+    return res.status(400).json({
+      message: "This email address is already verified.",
+    });
+  }
+
+  if (!(await validateEmailDeliverability(email))) {
+    return res.status(400).json({
+      message: "That email does not appear to be an existing, deliverable inbox. No verification code was sent.",
+    });
+  }
+
+  await sendEmailCode(user);
+
+  return res.json({
+    message: "A new email verification code was sent.",
+  });
 });
 
-app.post("/api/auth/start-phone-verification", resendLimiter, async (req, res) => {
-  const email = typeof req.body.email === "string" ? req.body.email.trim().toLowerCase() : "";
-  const phone = normalizeIndianPhone(req.body.phone);
-  if (!email || !phone) return res.status(400).json({ message: "Enter your account email and a valid Indian mobile number." });
-  const user = await User.findOne({ email });
-  if (!user) return res.status(400).json({ message: "The account could not be verified." });
-  if (!user.emailVerified) return res.status(403).json({ message: "Verify your email before adding a phone number." });
-  if (user.phoneVerified) return res.status(400).json({ message: "This account already has a verified phone number." });
-  const existingPhone = await User.findOne({ phone, _id: { $ne: user._id } }).lean();
-  if (existingPhone) return res.status(409).json({ message: "That phone number is already linked to another account." });
-  user.phone = phone;
-  user.phoneVerificationSentAt = undefined;
-  await user.save();
-  await sendPhoneCode(user);
-  return res.json({ message: "SMS verification code sent.", user: publicUser(user) });
-});
 
 app.get("/api/listings", async (req, res) => {
   const filter = { status: "available", $and: [{ city: { $regex: "bengaluru|bangalore", $options: "i" } }] };
-  if (req.query.city) filter.$and.push({ city: { $regex: String(req.query.city).replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), $options: "i" } });
-  if (req.query.maxRent && Number.isFinite(Number(req.query.maxRent))) filter.rent = { $lte: Number(req.query.maxRent) };
-  if (req.query.type) filter.propertyType = String(req.query.type);
-  if (req.query.bedrooms && Number.isFinite(Number(req.query.bedrooms))) filter.bedrooms = { $gte: Number(req.query.bedrooms) };
-  if (req.query.q) {
-    const query = String(req.query.q).slice(0, 100).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  if (req.query.city !== undefined) {
+    if (typeof req.query.city !== "string" || req.query.city.trim().length > 100) {
+      return res.status(400).json({ message: "Enter a neighborhood up to 100 characters." });
+    }
+    if (req.query.city.trim()) {
+      const city = req.query.city.trim().replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      filter.$and.push({ city: { $regex: city, $options: "i" } });
+    }
+  }
+  if (req.query.maxRent !== undefined) {
+    const maxRent = Number(req.query.maxRent);
+    if (typeof req.query.maxRent !== "string" || !req.query.maxRent.trim() || !Number.isFinite(maxRent) || maxRent < 0 || maxRent > 1000000) {
+      return res.status(400).json({ message: "Enter a valid maximum rent." });
+    }
+    filter.rent = { $lte: maxRent };
+  }
+  if (req.query.type !== undefined) {
+    const propertyTypes = ["Apartment", "House", "Room", "Loft", "Townhouse", "Studio"];
+    if (typeof req.query.type !== "string" || !propertyTypes.includes(req.query.type)) {
+      return res.status(400).json({ message: "Choose a valid property type." });
+    }
+    filter.propertyType = req.query.type;
+  }
+  if (req.query.category !== undefined) {
+    const categories = {
+      apartments: { propertyType: "Apartment" },
+      houses: { propertyType: { $in: ["House", "Townhouse"] } },
+      rooms: { propertyType: "Room" },
+      "pet-friendly": { amenities: { $regex: "pet", $options: "i" } },
+    };
+    if (typeof req.query.category !== "string" || !Object.hasOwn(categories, req.query.category)) {
+      return res.status(400).json({ message: "Choose a valid home category." });
+    }
+    Object.assign(filter, categories[req.query.category]);
+  }
+  if (req.query.bedrooms !== undefined) {
+    const bedrooms = Number(req.query.bedrooms);
+    if (typeof req.query.bedrooms !== "string" || !req.query.bedrooms.trim() || !Number.isFinite(bedrooms) || bedrooms < 0 || bedrooms > 50) {
+      return res.status(400).json({ message: "Enter a valid minimum bedroom count." });
+    }
+    filter.bedrooms = { $gte: bedrooms };
+  }
+  if (req.query.q !== undefined) {
+    if (typeof req.query.q !== "string" || req.query.q.trim().length > 100) {
+      return res.status(400).json({ message: "Search text must be 100 characters or fewer." });
+    }
+    const query = req.query.q.trim().replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    if (query) {
     filter.$or = [
       { title: { $regex: query, $options: "i" } },
       { description: { $regex: query, $options: "i" } },
       { city: { $regex: query, $options: "i" } },
       { address: { $regex: query, $options: "i" } },
     ];
+    }
   }
   const listings = await Listing.find(filter).select("-ownerEmail").sort({ createdAt: -1 }).limit(100).lean();
   return res.json({ listings });
@@ -658,11 +736,35 @@ app.use((error, _req, res, _next) => {
 async function startServer() {
   if (!process.env.MONGO_URI) throw new Error("MONGO_URI is required.");
   if (!JWT_SECRET || JWT_SECRET.length < 32) throw new Error("JWT_SECRET must be set to a random value of at least 32 characters.");
-  await mongoose.connect(process.env.MONGO_URI);
+  try {
+  await mongoose.connect(process.env.MONGO_URI, {
+    serverSelectionTimeoutMS: 10000,
+  });
+
+  console.log("MongoDB connected successfully");
+} catch (error) {
+  console.error("MongoDB connection details:");
+
+  console.error("Main error:", error.message);
+
+  const servers = error.reason?.servers;
+
+  if (servers) {
+    for (const [address, server] of servers.entries()) {
+      console.log("\nServer:", address);
+      console.log("Status:", server.type);
+      console.log("Error:", server.error?.message);
+      console.log("Error code:", server.error?.code);
+    }
+  }
+
+  throw error;
+}
   httpServer.listen(PORT, () => console.log(`RentNest API running on port ${PORT}`));
 }
 
 startServer().catch((error) => {
-  console.error("Backend startup failed:", error.message);
+  console.error("Backend startup failed:");
+  console.error(error);
   process.exitCode = 1;
 });

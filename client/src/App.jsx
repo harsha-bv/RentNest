@@ -163,7 +163,7 @@ function App() {
   const [authMode, setAuthMode] = useState('register')
   const [inquiries, setInquiries] = useState([])
   const [pendingUser, setPendingUser] = useState(null)
-  const [verification, setVerification] = useState({ email: false, phone: false })
+  const [verification, setVerification] = useState({ email: false})
   const [liveConnected, setLiveConnected] = useState(false)
   const [unreadInquiries, setUnreadInquiries] = useState(0)
   const [user, setUser] = useState(() => {
@@ -174,17 +174,34 @@ function App() {
   const [loading, setLoading] = useState(false)
 
   useEffect(() => {
-    fetch(`${API_BASE}/listings`)
-      .then(async (response) => {
-        if (!response.ok) throw new Error('Unable to load listings')
-        return response.json()
-      })
-      .then((data) => {
-        if (Array.isArray(data.listings)) setListings(data.listings.map((item) => ({ ...item, id: item._id || item.id })))
+    const controller = new AbortController()
+    const params = new URLSearchParams()
+    if (city.trim()) params.set('city', city.trim())
+    if (search.trim()) params.set('q', search.trim())
+    if (maxRent) params.set('maxRent', maxRent)
+    if (category !== 'All homes') params.set('category', category.toLowerCase().replace(/\s+/g, '-'))
+    const query = params.toString()
+
+    const timer = setTimeout(async () => {
+      try {
+        const response = await fetch(`${API_BASE}/listings${query ? `?${query}` : ''}`, {
+          signal: controller.signal,
+        })
+        if (!response.ok) throw new Error('Unable to load matching listings.')
+        const data = await response.json()
+        if (!Array.isArray(data.listings)) throw new Error('The server returned invalid listing data.')
+        setListings(data.listings.map((item) => ({ ...item, id: item._id || item.id })))
         setApiReady(true)
-      })
-      .catch(() => setApiReady(false))
-  }, [])
+      } catch (error) {
+        if (error.name !== 'AbortError') setApiReady(false)
+      }
+    }, 250)
+
+    return () => {
+      clearTimeout(timer)
+      controller.abort()
+    }
+  }, [category, city, maxRent, search])
 
   useEffect(() => {
     const socket = io(SERVER_ROOT || window.location.origin, {
@@ -239,12 +256,28 @@ function App() {
     localStorage.setItem('rentnest-favorites', JSON.stringify(updated))
   }
 
-  function signOut() {
+  async function signOut() {
+    const activeToken = token
     localStorage.removeItem(TOKEN_KEY)
     localStorage.removeItem(USER_KEY)
     setToken('')
     setUser(null)
-    setToast('You have been signed out.')
+    setPendingUser(null)
+    if (!activeToken) {
+      setToast('You have been signed out on this device.')
+      return
+    }
+    try {
+      const response = await fetch(`${API_BASE}/auth/logout`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${activeToken}` },
+      })
+      const data = await response.json()
+      if (!response.ok) throw new Error(data.message || 'The server could not revoke this session.')
+      setToast(data.message || 'You have been securely signed out.')
+    } catch {
+      setToast('Signed out on this device, but the server could not revoke the session. If the device is shared, sign out again when online.')
+    }
   }
 
   async function submitAuth(event) {
@@ -256,14 +289,19 @@ function App() {
       const response = await fetch(`${API_BASE}/auth/${values.mode}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ name: values.name, email: values.email, phone: values.phone, password: values.password, role: values.role }),
+        body: JSON.stringify({
+          name: values.name,
+          email: values.email,
+          password: values.password,
+          role: values.role,
+        }),
       })
       const data = await response.json()
       if (data.verificationRequired && data.user) {
         setPendingUser(data.user)
-        setVerification({ email: Boolean(data.user.emailVerified), phone: Boolean(data.user.phoneVerified) })
+        setVerification({ email: Boolean(data.user.emailVerified) })
         setModal('verification')
-        setToast(data.message || 'Verify your email and phone to continue.')
+        setToast(data.message || 'Verify your email to continue.')
         return
       }
       if (!response.ok) throw new Error(data.message || 'Could not sign in.')
@@ -280,76 +318,73 @@ function App() {
     }
   }
 
-  async function submitVerification(event, channel) {
-    event.preventDefault()
-    const code = new FormData(event.currentTarget).get('code')
-    setLoading(true)
-    try {
-      const response = await fetch(`${API_BASE}/auth/verify-${channel}`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ email: pendingUser.email, phone: pendingUser.phone, code }),
-      })
-      const data = await response.json()
-      if (!response.ok) throw new Error(data.message || `Could not verify ${channel}.`)
-      setPendingUser(data.user)
-      setVerification((current) => ({ ...current, [channel]: true }))
-      if (data.token) {
-        localStorage.setItem(TOKEN_KEY, data.token)
-        localStorage.setItem(USER_KEY, JSON.stringify(data.user))
-        setToken(data.token)
-        setUser(data.user)
-        setPendingUser(null)
-        setModal('')
-        setToast(`Welcome${data.user.name ? `, ${data.user.name.split(' ')[0]}` : ''}! Your account is verified.`)
-      } else {
-        setToast(`${channel === 'email' ? 'Email' : 'Phone'} verified. Verify the other method to activate your account.`)
-      }
-    } catch (error) {
-      setToast(error.message || `Could not verify ${channel}. Please try again.`)
-    } finally {
-      setLoading(false)
-    }
-  }
+  async function submitVerification(event) {
+  event.preventDefault()
 
-  async function startPhoneVerification(event) {
-    event.preventDefault()
-    const phone = new FormData(event.currentTarget).get('phone')
-    setLoading(true)
-    try {
-      const response = await fetch(`${API_BASE}/auth/start-phone-verification`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ email: pendingUser.email, phone }),
-      })
-      const data = await response.json()
-      if (!response.ok) throw new Error(data.message || 'Could not send an SMS code.')
-      setPendingUser(data.user)
-      setToast(data.message)
-    } catch (error) {
-      setToast(error.message || 'Could not send an SMS code. Please try again.')
-    } finally {
-      setLoading(false)
-    }
-  }
+  const code = new FormData(event.currentTarget).get('code')
+  setLoading(true)
 
-  async function resendVerification(channel) {
-    setLoading(true)
-    try {
-      const response = await fetch(`${API_BASE}/auth/resend-verification`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ email: pendingUser.email, channel }),
-      })
-      const data = await response.json()
-      if (!response.ok) throw new Error(data.message || `Could not resend the ${channel} code.`)
-      setToast(data.message)
-    } catch (error) {
-      setToast(error.message || `Could not resend the ${channel} code.`)
-    } finally {
-      setLoading(false)
+  try {
+    const response = await fetch(`${API_BASE}/auth/verify-email`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        email: pendingUser.email,
+        code,
+      }),
+    })
+
+    const data = await response.json()
+
+    if (!response.ok) {
+      throw new Error(data.message || 'Could not verify your email.')
     }
+
+    if (!data.token) {
+      throw new Error('Email verified, but the server did not return a login token. Please sign in.')
+    }
+
+    localStorage.setItem(TOKEN_KEY, data.token)
+    localStorage.setItem(USER_KEY, JSON.stringify(data.user))
+
+    setToken(data.token)
+    setUser(data.user)
+    setPendingUser(null)
+    setModal('')
+    setVerification({ email: true })
+    setToast('Your email is verified. Welcome to RentNest!')
+  } catch (error) {
+    setToast(error.message || 'Could not verify your email. Please try again.')
+  } finally {
+    setLoading(false)
   }
+}
+
+async function resendVerification() {
+  if (!pendingUser?.email) return
+
+  setLoading(true)
+
+  try {
+    const response = await fetch(`${API_BASE}/auth/resend-verification`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email: pendingUser.email }),
+    })
+
+    const data = await response.json()
+
+    if (!response.ok) {
+      throw new Error(data.message || 'Could not resend the email code.')
+    }
+
+    setToast(data.message || 'A new email verification code was sent.')
+  } catch (error) {
+    setToast(error.message || 'Could not resend the email code.')
+  } finally {
+    setLoading(false)
+  }
+}
 
   async function submitListing(event) {
     event.preventDefault()
@@ -561,18 +596,68 @@ function App() {
         {modal === 'auth' && <><span className="eyebrow"><span className="eyebrow-line" /> A little closer to home</span><h2 id="form-modal-title">{authMode === 'login' ? <>Welcome <em>back.</em></> : <>Come on <em>in.</em></>}</h2><p className="form-intro">Create an account to find a Bengaluru home, contact owners, or share a place of your own.</p><form className="stacked-form" onSubmit={submitAuth}>
           {authMode === 'register' && <label>I'm here as<select name="role" defaultValue="renter"><option value="renter">A renter, looking for a place</option><option value="owner">An owner, sharing a place</option></select></label>}
           {authMode === 'register' && <label>Your name<input name="name" minLength="2" maxLength="80" autoComplete="name" placeholder="How should we call you?" required /></label>}
-          <label>Email address<input name="email" type="email" autoComplete="email" maxLength="254" placeholder="you@example.com" required /></label>
-          {authMode === 'register' && <label>Indian mobile number<input name="phone" type="tel" inputMode="tel" autoComplete="tel" maxLength="18" placeholder="+91 98765 43210" required /></label>}
+          <label>Email address{authMode === 'register' && <span className="field-hint">Use an inbox you can access; we’ll send a verification code.</span>}<input name="email" type="email" autoComplete="email" maxLength="254" placeholder="Enter your email address" required /></label>
           <label>Password<input name="password" type="password" autoComplete={authMode === 'login' ? 'current-password' : 'new-password'} minLength="8" maxLength="72" placeholder="At least 8 characters" required /></label>
           <input type="hidden" name="mode" value={authMode} />
           <button className="primary-button full-button" type="submit" disabled={loading}>{loading ? 'One moment…' : authMode === 'login' ? 'Sign in' : 'Create your free account'} <Icon name="arrow" size={17} /></button>
         </form><p className="auth-switch">{authMode === 'login' ? 'New to RentNest?' : 'Already have an account?'} <button type="button" onClick={() => setAuthMode(authMode === 'login' ? 'register' : 'login')}>{authMode === 'login' ? 'Create an account' : 'Sign in'}</button></p></>}
-        {modal === 'verification' && pendingUser && <><span className="eyebrow"><span className="eyebrow-line" /> Secure your RentNest account</span><h2 id="form-modal-title">Verify your <em>details.</em></h2><p className="form-intro">Enter the 6-digit codes we sent to {pendingUser.email} and your Indian mobile number. Both are required before you can sign in.</p>
-          <div className="verification-list">
-            {verification.email ? <p className="verified-message">✓ Email verified</p> : <form className="verification-form" onSubmit={(event) => submitVerification(event, 'email')}><label>Email code<input name="code" type="text" inputMode="numeric" autoComplete="one-time-code" pattern="[0-9]{6}" maxLength="6" placeholder="6-digit code" required /></label><div className="verification-actions"><button className="primary-button" type="submit" disabled={loading}>Verify email</button><button className="resend-button" type="button" disabled={loading} onClick={() => resendVerification('email')}>Resend code</button></div></form>}
-            {!pendingUser.phone ? <form className="verification-form" onSubmit={startPhoneVerification}><label>Add an Indian mobile number<input name="phone" type="tel" inputMode="tel" autoComplete="tel" maxLength="18" placeholder="+91 98765 43210" required /></label><button className="primary-button" type="submit" disabled={loading || !verification.email}>Send SMS code</button>{!verification.email && <small className="verification-hint">Verify your email before adding a phone number.</small>}</form> : verification.phone ? <p className="verified-message">✓ Phone verified: {pendingUser.phone}</p> : <form className="verification-form" onSubmit={(event) => submitVerification(event, 'phone')}><label>SMS code sent to {pendingUser.phone}<input name="code" type="text" inputMode="numeric" autoComplete="one-time-code" pattern="[0-9]{6}" maxLength="6" placeholder="6-digit code" required /></label><div className="verification-actions"><button className="primary-button" type="submit" disabled={loading}>Verify phone</button><button className="resend-button" type="button" disabled={loading} onClick={() => resendVerification('phone')}>Resend SMS</button></div></form>}
-          </div>
-        </>}
+        {modal === 'verification' && pendingUser && <>
+  <span className="eyebrow">
+    <span className="eyebrow-line" /> Secure your RentNest account
+  </span>
+
+  <h2 id="form-modal-title">
+    Verify your <em>email.</em>
+  </h2>
+
+  <p className="form-intro">
+    Enter the 6-digit verification code sent to {pendingUser.email}.
+  </p>
+
+  <div className="verification-list">
+    {verification.email ? (
+      <p className="verified-message">✓ Email verified</p>
+    ) : (
+      <form
+        className="verification-form"
+        onSubmit={submitVerification}
+      >
+        <label>
+          Email verification code
+          <input
+            name="code"
+            type="text"
+            inputMode="numeric"
+            autoComplete="one-time-code"
+            pattern="[0-9]{6}"
+            maxLength="6"
+            placeholder="6-digit code"
+            required
+          />
+        </label>
+
+        <div className="verification-actions">
+          <button
+            className="primary-button"
+            type="submit"
+            disabled={loading}
+          >
+            Verify email
+          </button>
+
+          <button
+            className="resend-button"
+            type="button"
+            disabled={loading}
+            onClick={resendVerification}
+          >
+            Resend code
+          </button>
+        </div>
+      </form>
+    )}
+  </div>
+</>}
         {modal === 'listing' && <><span className="eyebrow"><span className="eyebrow-line" /> Good homes find good people</span><h2 id="form-modal-title">Share your <em>place.</em></h2><p className="form-intro">Add the details renters care about. You can upload up to 10 photos or videos.</p><form className="stacked-form listing-form" onSubmit={submitListing}>
           <label>Listing title<input name="title" minLength="8" maxLength="100" required placeholder="A bright, quiet home near the park" /></label>
           <label>Tell us about it<textarea name="description" rows="3" minLength="30" maxLength="2000" required placeholder="What makes this place feel like home?" /></label>
